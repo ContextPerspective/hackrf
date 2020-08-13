@@ -73,7 +73,7 @@ typedef enum {
 	HACKRF_VENDOR_REQUEST_SET_TXVGA_GAIN = 21,
 	HACKRF_VENDOR_REQUEST_ANTENNA_ENABLE = 23,
 	HACKRF_VENDOR_REQUEST_SET_FREQ_EXPLICIT = 24,
-	// USB_WCID_VENDOR_REQ = 25
+	HACKRF_VENDOR_REQUEST_USB_WCID_VENDOR_REQ = 25,
 	HACKRF_VENDOR_REQUEST_INIT_SWEEP = 26,
 	HACKRF_VENDOR_REQUEST_OPERACAKE_GET_BOARDS = 27,
 	HACKRF_VENDOR_REQUEST_OPERACAKE_SET_PORTS = 28,
@@ -84,6 +84,8 @@ typedef enum {
 	HACKRF_VENDOR_REQUEST_SPIFLASH_STATUS = 33,
 	HACKRF_VENDOR_REQUEST_SPIFLASH_CLEAR_STATUS = 34,
 	HACKRF_VENDOR_REQUEST_OPERACAKE_GPIO_TEST = 35,
+	HACKRF_VENDOR_REQUEST_CPLD_CHECKSUM = 36,
+	HACKRF_VENDOR_REQUEST_UI_ENABLE = 37,
 } hackrf_vendor_request;
 
 #define USB_CONFIG_STANDARD 0x1
@@ -94,6 +96,7 @@ typedef enum {
 	HACKRF_TRANSCEIVER_MODE_TRANSMIT = 2,
 	HACKRF_TRANSCEIVER_MODE_SS = 3,
 	TRANSCEIVER_MODE_CPLD_UPDATE = 4,
+	TRANSCEIVER_MODE_RX_SWEEP = 5,
 } hackrf_transceiver_mode;
 
 typedef enum {
@@ -212,6 +215,8 @@ static int allocate_transfers(hackrf_device* const device)
 		{
 			return HACKRF_ERROR_NO_MEM;
 		}
+
+		memset(device->buffer, 0, TRANSFER_COUNT * TRANSFER_BUFFER_SIZE);
 
 		for(transfer_index=0; transfer_index<TRANSFER_COUNT; transfer_index++)
 		{
@@ -1628,12 +1633,12 @@ int ADDCALL hackrf_start_rx(hackrf_device* device, hackrf_sample_block_cb_fn cal
 int ADDCALL hackrf_stop_rx(hackrf_device* device)
 {
 	int result;
-	result = hackrf_set_transceiver_mode(device, HACKRF_TRANSCEIVER_MODE_OFF);
+	result = kill_transfer_thread(device);
 	if (result != HACKRF_SUCCESS)
 	{
 		return result;
 	}
-	return kill_transfer_thread(device);
+	return hackrf_set_transceiver_mode(device, HACKRF_TRANSCEIVER_MODE_OFF);
 }
 
 int ADDCALL hackrf_start_tx(hackrf_device* device, hackrf_sample_block_cb_fn callback, void* tx_ctx)
@@ -1652,12 +1657,13 @@ int ADDCALL hackrf_start_tx(hackrf_device* device, hackrf_sample_block_cb_fn cal
 int ADDCALL hackrf_stop_tx(hackrf_device* device)
 {
 	int result;
-	result = hackrf_set_transceiver_mode(device, HACKRF_TRANSCEIVER_MODE_OFF);
+	result = kill_transfer_thread(device);
 	if (result != HACKRF_SUCCESS)
 	{
 		return result;
 	}
-	return kill_transfer_thread(device);
+
+	return hackrf_set_transceiver_mode(device, HACKRF_TRANSCEIVER_MODE_OFF);
 }
 
 int ADDCALL hackrf_close(hackrf_device* device)
@@ -1848,7 +1854,7 @@ uint32_t ADDCALL hackrf_compute_baseband_filter_bw(const uint32_t bandwidth_hz)
 	return p->bandwidth_hz;
 }
 
-/* All features below require USB API version 0x1002 or higher) */
+/* All features below require USB API version 0x0102 or higher) */
 
 int ADDCALL hackrf_set_hw_sync_mode(hackrf_device* device, const uint8_t value) {
 	USB_API_REQUIRED(device, 0x0102)
@@ -2102,6 +2108,75 @@ int ADDCALL hackrf_operacake_gpio_test(hackrf_device* device, const uint8_t addr
 	} else {
 		return HACKRF_SUCCESS;
 	}
+}
+
+#ifdef HACKRF_ISSUE_609_IS_FIXED
+int ADDCALL hackrf_cpld_checksum(hackrf_device* device,
+								 uint32_t* crc)
+{
+	USB_API_REQUIRED(device, 0x0103)
+	uint8_t length;
+	int result;
+	
+	length = sizeof(*crc);
+	result = libusb_control_transfer(
+		device->usb_device,
+		LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+		HACKRF_VENDOR_REQUEST_CPLD_CHECKSUM,
+		0,
+		0,
+		(unsigned char*)crc,
+		length,
+		0
+	);
+
+	if (result < length)
+	{
+		last_libusb_error = result;
+		return HACKRF_ERROR_LIBUSB;
+	} else {
+		*crc = TO_LE(*crc);
+		return HACKRF_SUCCESS;
+	}
+}
+#endif /* HACKRF_ISSUE_609_IS_FIXED */
+
+int ADDCALL hackrf_set_ui_enable(hackrf_device* device, const uint8_t value)
+{
+	USB_API_REQUIRED(device, 0x0104)
+	int result;
+	result = libusb_control_transfer(
+		device->usb_device,
+		LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+		HACKRF_VENDOR_REQUEST_UI_ENABLE,
+		value,
+		0,
+		NULL,
+		0,
+		0
+	);
+
+	if (result != 0)
+	{
+		last_libusb_error = result;
+		return HACKRF_ERROR_LIBUSB;
+	} else {
+		return HACKRF_SUCCESS;
+	}
+}
+
+int ADDCALL hackrf_start_rx_sweep(hackrf_device* device, hackrf_sample_block_cb_fn callback, void* rx_ctx)
+{
+	USB_API_REQUIRED(device, 0x0104)
+	int result;
+	const uint8_t endpoint_address = LIBUSB_ENDPOINT_IN | 1;
+	result = hackrf_set_transceiver_mode(device, TRANSCEIVER_MODE_RX_SWEEP);
+	if (HACKRF_SUCCESS == result)
+	{
+		device->rx_ctx = rx_ctx;
+		result = create_transfer_thread(device, endpoint_address, callback);
+	}
+	return result;
 }
 
 #ifdef __cplusplus

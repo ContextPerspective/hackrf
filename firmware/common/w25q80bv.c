@@ -52,7 +52,7 @@
 
 /*
  * Set up pins for GPIO and SPI control, configure SSP0 peripheral for SPI.
- * SSP0_SSEL is controlled by GPIO in order to handle various transfer lengths.
+ * SSP0_CS is controlled by GPIO in order to handle various transfer lengths.
  */
 void w25q80bv_setup(w25q80bv_driver_t* const drv)
 {
@@ -113,7 +113,7 @@ void w25q80bv_write_enable(w25q80bv_driver_t* const drv)
 
 	uint8_t data[] = { W25Q80BV_WRITE_ENABLE };
 	spi_bus_transfer(drv->bus, data, ARRAY_SIZE(data));
-	while (w25q80bv_get_status(drv) ^ W25Q80BV_STATUS_WEL);
+	while (!(w25q80bv_get_status(drv) & W25Q80BV_STATUS_WEL));
 }
 
 void w25q80bv_chip_erase(w25q80bv_driver_t* const drv)
@@ -125,8 +125,8 @@ void w25q80bv_chip_erase(w25q80bv_driver_t* const drv)
 	} while(device_id != W25Q80BV_DEVICE_ID_RES &&
 		device_id != W25Q16DV_DEVICE_ID_RES);
 
-	w25q80bv_write_enable(drv);
 	w25q80bv_wait_while_busy(drv);
+	w25q80bv_write_enable(drv);
 
 	uint8_t data[] = { W25Q80BV_CHIP_ERASE };
 	spi_bus_transfer(drv->bus, data, ARRAY_SIZE(data));
@@ -143,8 +143,8 @@ static void w25q80bv_page_program(w25q80bv_driver_t* const drv, const uint32_t a
 	if (addr > (drv->num_bytes - len))
 		return;
 
-	w25q80bv_write_enable(drv);
 	w25q80bv_wait_while_busy(drv);
+	w25q80bv_write_enable(drv);
 
 	uint8_t header[] = {
 		W25Q80BV_PAGE_PROGRAM,
@@ -230,8 +230,8 @@ void w25q80bv_read(w25q80bv_driver_t* const drv, uint32_t addr, uint32_t len, ui
 
 void w25q80bv_clear_status(w25q80bv_driver_t* const drv)
 {
-	w25q80bv_write_enable(drv);
 	w25q80bv_wait_while_busy(drv);
+	w25q80bv_write_enable(drv);
 	uint8_t data[] = { W25Q80BV_WRITE_STATUS, 0x00, 0x00 };
 	spi_bus_transfer(drv->bus, data, ARRAY_SIZE(data));
 }

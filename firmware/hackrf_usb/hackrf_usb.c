@@ -22,7 +22,9 @@
 
 #include <stddef.h>
 
+#include <libopencm3/lpc43xx/ipc.h>
 #include <libopencm3/lpc43xx/m4/nvic.h>
+#include <libopencm3/lpc43xx/rgu.h>
 
 #include <streaming.h>
 
@@ -44,11 +46,18 @@
 #include "operacake.h"
 #include "usb_api_sweep.h"
 #include "usb_api_transceiver.h"
+#include "usb_api_ui.h"
 #include "usb_bulk_buffer.h"
+#include "cpld_xc2c.h"
+#include "portapack.h"
  
-#include "hackrf-ui.h"
+#include "hackrf_ui.h"
 
-static const usb_request_handler_fn vendor_request_handler[] = {
+extern uint32_t __m0_start__;
+extern uint32_t __m0_end__;
+extern uint32_t __ram_m0_start__;
+
+static usb_request_handler_fn vendor_request_handler[] = {
 	NULL,
 	usb_vendor_request_set_transceiver_mode,
 	usb_vendor_request_write_max2837,
@@ -93,7 +102,13 @@ static const usb_request_handler_fn vendor_request_handler[] = {
 	usb_vendor_request_set_clkout_enable,
 	usb_vendor_request_spiflash_status,
 	usb_vendor_request_spiflash_clear_status,
-	usb_vendor_request_operacake_gpio_test
+	usb_vendor_request_operacake_gpio_test,
+#ifdef HACKRF_ONE
+	usb_vendor_request_cpld_checksum,
+#else
+	NULL,
+#endif
+	usb_vendor_request_set_ui_enable,
 };
 
 static const uint32_t vendor_request_handler_count =
@@ -129,13 +144,13 @@ void usb_configuration_changed(
 	set_transceiver_mode(TRANSCEIVER_MODE_OFF);
 	if( device->configuration->number == 1 ) {
 		// transceiver configuration
-		cpu_clock_pll1_max_speed();
 		led_on(LED1);
 	} else {
 		/* Configuration number equal 0 means usb bus reset. */
-		cpu_clock_pll1_low_speed();
 		led_off(LED1);
 	}
+	usb_endpoint_init(&usb_endpoint_bulk_in);
+	usb_endpoint_init(&usb_endpoint_bulk_out);
 }
 
 void usb_set_descriptor_by_serial_number(void)
@@ -163,7 +178,26 @@ void usb_set_descriptor_by_serial_number(void)
 	}
 }
 
+static bool cpld_jtag_sram_load(jtag_t* const jtag) {
+	cpld_jtag_take(jtag);
+	cpld_xc2c64a_jtag_sram_write(jtag, &cpld_hackrf_program_sram);
+	const bool success = cpld_xc2c64a_jtag_sram_verify(jtag, &cpld_hackrf_program_sram, &cpld_hackrf_verify);
+	cpld_jtag_release(jtag);
+	return success;
+}
+
+static void m0_rom_to_ram() {
+	uint32_t *dest = &__ram_m0_start__;
+	uint32_t *src = &__m0_start__;
+	while (src < &__m0_end__) {
+		*dest = *src;
+		dest++;
+		src++;
+	}
+}
+
 int main(void) {
+	bool operacake_allow_gpio;
 	pin_setup();
 	enable_1v8_power();
 #if (defined HACKRF_ONE || defined RAD1O)
@@ -173,6 +207,18 @@ int main(void) {
 	delay(1000000);
 #endif
 	cpu_clock_init();
+
+	/* Wake the M0 */
+	m0_rom_to_ram();
+	ipc_start_m0((uint32_t)&__ram_m0_start__);
+
+	if( !cpld_jtag_sram_load(&jtag_cpld) ) {
+		halt_and_flash(6000000);
+	}
+
+#ifdef HACKRF_ONE
+	portapack_init();
+#endif
 
 #ifndef DFU_MODE
 	usb_set_descriptor_by_serial_number();
@@ -193,52 +239,35 @@ int main(void) {
 	
 	nvic_set_priority(NVIC_USB0_IRQ, 255);
 
-	hackrf_ui_init();
+	hackrf_ui()->init();
 
 	usb_run(&usb_device);
 	
 	rf_path_init(&rf_path);
-	operacake_init();
 
-	unsigned int phase = 0;
+	if( hackrf_ui()->operacake_gpio_compatible() ) {
+		operacake_allow_gpio = true;
+	} else {
+		operacake_allow_gpio = false;
+	}
+	operacake_init(operacake_allow_gpio);
 
 	while(true) {
-		// Check whether we need to initiate a CPLD update
-		if (start_cpld_update)
-			cpld_update();
-
-		// Check whether we need to initiate sweep mode
-		if (start_sweep_mode) {
-			start_sweep_mode = false;
+		switch (transceiver_mode()) {
+		case TRANSCEIVER_MODE_RX:
+			rx_mode();
+			break;
+		case TRANSCEIVER_MODE_TX:
+			tx_mode();
+			break;
+		case TRANSCEIVER_MODE_RX_SWEEP:
 			sweep_mode();
-		}
-
-		// Set up IN transfer of buffer 0.
-		if ( usb_bulk_buffer_offset >= 16384
-		     && phase == 1
-		     && transceiver_mode() != TRANSCEIVER_MODE_OFF) {
-			usb_transfer_schedule_block(
-				(transceiver_mode() == TRANSCEIVER_MODE_RX)
-				? &usb_endpoint_bulk_in : &usb_endpoint_bulk_out,
-				&usb_bulk_buffer[0x0000],
-				0x4000,
-				NULL, NULL
-				);
-			phase = 0;
-		}
-
-		// Set up IN transfer of buffer 1.
-		if ( usb_bulk_buffer_offset < 16384
-		     && phase == 0
-		     && transceiver_mode() != TRANSCEIVER_MODE_OFF) {
-			usb_transfer_schedule_block(
-				(transceiver_mode() == TRANSCEIVER_MODE_RX)
-				? &usb_endpoint_bulk_in : &usb_endpoint_bulk_out,
-				&usb_bulk_buffer[0x4000],
-				0x4000,
-				NULL, NULL
-			);
-			phase = 1;
+			break;
+		case TRANSCEIVER_MODE_CPLD_UPDATE:
+			cpld_update();
+			break;
+		default:
+			break;
 		}
 	}
 
